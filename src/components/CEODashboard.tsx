@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const deptColors: Record<string, string> = { Prospect: "#2F80FF", Paid: "#7B61FF", Publish: "#2F80FF", Partner: "#7B61FF", Sales: "#FF4EDB", All: "#8A8F98" };
 
@@ -297,11 +297,56 @@ export default function CEODashboard() {
   const [startDate, setStartDate] = useState(toISO(thirtyAgo));
   const [endDate, setEndDate] = useState(toISO(today));
   const [showEngine, setShowEngine] = useState(false);
-  const d = useMemo(() => generateData(fromISO(startDate), fromISO(endDate)), [startDate, endDate]);
+  const [d, setD] = useState<DataResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetch(`/api/metrics?start=${startDate}&end=${endDate}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`API returned ${r.status}`);
+        return r.json();
+      })
+      .then((data: DataResult) => {
+        if (!cancelled) setD(data);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error("[CEODashboard] Failed to load /api/metrics, falling back to demo data:", err);
+          setError("Could not reach /api/metrics — showing demo data instead.");
+          setD(generateData(fromISO(startDate), fromISO(endDate)));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [startDate, endDate]);
+
+  if (loading && !d) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#0B0F19", display: "flex", alignItems: "center", justifyContent: "center", color: "#6B7186", fontFamily: "'Inter', system-ui, sans-serif" }}>
+        Loading metrics…
+      </div>
+    );
+  }
+
+  if (!d) return null;
 
   return (
     <div style={{ minHeight: "100vh", background: "#0B0F19", fontFamily: "'Inter', system-ui, sans-serif", color: "#F5F7FA" }}>
       <div style={{ height: 3, background: "linear-gradient(90deg, #2F80FF, #7B61FF, #FF4EDB, #7B61FF, #2F80FF)" }} />
+
+      {error && (
+        <div style={{ background: "rgba(245,158,11,0.1)", borderBottom: "1px solid rgba(245,158,11,0.3)", padding: "8px 24px", fontSize: 12, color: "#F59E0B" }}>
+          ⚠️ {error}
+        </div>
+      )}
 
       {/* Header */}
       <div style={{ background: "linear-gradient(180deg, #111624, #0B0F19)", borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "20px 24px 16px" }}>
