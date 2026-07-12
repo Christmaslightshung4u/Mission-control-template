@@ -1,184 +1,90 @@
-import { NextRequest, NextResponse } from "next/server";
-import { execute } from "@/lib/db";
+import { NextResponse } from 'next/server';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
-// ---------------------------------------------------------------------------
-// GET /api/metrics?start=YYYY-MM-DD&end=YYYY-MM-DD
-//
-// Computes real CEO Dashboard numbers from the database for the given date
-// range, plus the same range shifted backward as the "previous period" for
-// trend comparisons. Replaces the old hardcoded generateData() fake data.
-//
-// This is intentionally a starting point: `promote.channels`, `profit.funnels`,
-// `produce.offers`, and per-segment `activeClients` counts return empty/zero
-// until you add the richer tables + inserts for those breakdowns. The top-line
-// numbers (revenue, sales, leads, event registrations, conversion rate,
-// referrals, ad spend/ROAS) are real, computed from the `sales`, `leads`,
-// `event_registrations`, and `ad_spend` tables below.
-// ---------------------------------------------------------------------------
+export const dynamic = 'force-dynamic';
 
-function daysBetween(a: Date, b: Date) {
-  return Math.max(1, Math.round((b.getTime() - a.getTime()) / (1000 * 60 * 60 * 24)));
+function getStripeKey(): string | null {
+  try {
+    const configPath = join(process.cwd(), '..', 'config', 'stripe.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    return config.secret_key;
+  } catch {
+    return process.env.CASHFLOW_STRIPE_KEY || process.env.STRIPE_SECRET_KEY || null;
+  }
 }
 
-export async function GET(req: NextRequest) {
+interface PipelineEntry {
+  name: string;
+  email: string | null;
+  depositDate: string;
+  daysSinceDeposit: number;
+  lowValue: number;  // if they choose rev share path ($1,500 remainder)
+  highValue: number; // if they choose buyout path ($4,000 remainder)
+}
+
+export async function GET() {
   try {
-    const { searchParams } = new URL(req.url);
-    const endStr = searchParams.get("end") || new Date().toISOString().split("T")[0];
-    const startStr =
-      searchParams.get("start") ||
-      (() => {
-        const d = new Date(endStr);
-        d.setDate(d.getDate() - 30);
-        return d.toISOString().split("T")[0];
-      })();
+    const stripeKey = getStripeKey();
+    if (!stripeKey) {
+      return NextResponse.json({ openDeposits: [], totalLow: 0, totalHigh: 0 });
+    }
 
-    const start = new Date(startStr);
-    const end = new Date(endStr);
-    const days = daysBetween(start, end);
+    const res = await fetch('https://api.stripe.com/v1/charges?limit=100', {
+      headers: { Authorization: `Bearer ${stripeKey}` },
+    });
 
-    // Previous period of equal length, immediately before `start`.
-    const prevEnd = new Date(start);
-    prevEnd.setDate(prevEnd.getDate() - 1);
-    const prevStart = new Date(prevEnd);
-    prevStart.setDate(prevStart.getDate() - (days - 1));
+    if (!res.ok) throw new Error(`Stripe error ${res.status}`);
+    const data = await res.json();
 
-    const prevStartStr = prevStart.toISOString().split("T")[0];
-    const prevEndStr = prevEnd.toISOString().split("T")[0];
+    const charges = (data.data || []).filter((c: { status: string }) => c.status === 'succeeded');
 
-    // End-of-day bound so the range is inclusive of the whole end date.
-    const startBound = `${startStr} 00:00:00`;
-    const endBound = `${endStr} 23:59:59`;
-    const prevStartBound = `${prevStartStr} 00:00:00`;
-    const prevEndBound = `${prevEndStr} 23:59:59`;
+    // Group by name
+    const byName: Record<string, { amounts: number[]; dates: number[]; email: string | null }> = {};
+    for (const c of charges) {
+      const name = (c.billing_details?.name || c.receipt_email || 'Unknown').trim();
+      const email = c.billing_details?.email || c.receipt_email || null;
+      if (!byName[name]) byName[name] = { amounts: [], dates: [], email };
+      byName[name].amounts.push(c.amount / 100);
+      byName[name].dates.push(c.created);
+    }
 
-    const [
-      revenueNow,
-      revenuePrev,
-      leadsNow,
-      leadsPrev,
-      regsNow,
-      regsPrev,
-      referralsNow,
-      referralsPrev,
-      adSpendNow,
-    ] = await Promise.all([
-      execute(
-        `SELECT COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total FROM sales WHERE created_at BETWEEN :s AND :e`,
-        { s: startBound, e: endBound }
-      ),
-      execute(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM sales WHERE created_at BETWEEN :s AND :e`,
-        { s: prevStartBound, e: prevEndBound }
-      ),
-      execute(
-        `SELECT COUNT(*) as cnt FROM leads WHERE created_at BETWEEN :s AND :e`,
-        { s: startBound, e: endBound }
-      ),
-      execute(
-        `SELECT COUNT(*) as cnt FROM leads WHERE created_at BETWEEN :s AND :e`,
-        { s: prevStartBound, e: prevEndBound }
-      ),
-      execute(
-        `SELECT
-           SUM(CASE WHEN event_type = 'webinar' THEN 1 ELSE 0 END) as webinar,
-           SUM(CASE WHEN event_type = 'challenge' THEN 1 ELSE 0 END) as challenge,
-           COUNT(*) as total
-         FROM event_registrations WHERE created_at BETWEEN :s AND :e`,
-        { s: startBound, e: endBound }
-      ),
-      execute(
-        `SELECT COUNT(*) as cnt FROM event_registrations WHERE created_at BETWEEN :s AND :e`,
-        { s: prevStartBound, e: prevEndBound }
-      ),
-      execute(
-        `SELECT COUNT(*) as cnt FROM leads WHERE source = 'referral' AND created_at BETWEEN :s AND :e`,
-        { s: startBound, e: endBound }
-      ),
-      execute(
-        `SELECT COUNT(*) as cnt FROM leads WHERE source = 'referral' AND created_at BETWEEN :s AND :e`,
-        { s: prevStartBound, e: prevEndBound }
-      ),
-      execute(
-        `SELECT COALESCE(SUM(amount), 0) as spend, COALESCE(SUM(revenue_attributed), 0) as revenue
-         FROM ad_spend WHERE created_at BETWEEN :s AND :e`,
-        { s: startBound, e: endBound }
-      ),
-    ]);
+    // Find open deposits: paid $1K deposit but no remainder ($1,500 or $4,000) yet
+    const openDeposits: PipelineEntry[] = [];
+    const now = Date.now() / 1000;
 
-    const revenueRow = revenueNow.rows[0] as unknown as { cnt: number; total: number };
-    const revenuePrevTotal = Number((revenuePrev.rows[0] as unknown as { total: number })?.total ?? 0);
-    const leadsCurrent = Number((leadsNow.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const leadsPrevious = Number((leadsPrev.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const regsRow = regsNow.rows[0] as unknown as { webinar: number; challenge: number; total: number };
-    const regsPrevTotal = Number((regsPrev.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const referralsCurrent = Number((referralsNow.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const referralsPrevious = Number((referralsPrev.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const adSpendRow = adSpendNow.rows[0] as unknown as { spend: number; revenue: number };
+    for (const [name, data] of Object.entries(byName)) {
+      const hasDeposit = data.amounts.includes(1000);
+      const hasRemainder = data.amounts.some(a => a === 1500 || a === 4000);
+      if (hasDeposit && !hasRemainder) {
+        const depositTimestamp = Math.min(...data.dates.filter((_, i) => data.amounts[i] === 1000));
+        const depositDate = new Date(depositTimestamp * 1000).toISOString().split('T')[0];
+        const daysSince = Math.floor((now - depositTimestamp) / 86400);
+        openDeposits.push({
+          name,
+          email: data.email,
+          depositDate,
+          daysSinceDeposit: daysSince,
+          lowValue: 1500,
+          highValue: 4000,
+        });
+      }
+    }
 
-    const revenueCurrent = Number(revenueRow?.total ?? 0);
-    const salesCount = Number(revenueRow?.cnt ?? 0);
-    const conversionRateCurrent = leadsCurrent > 0 ? Math.round((salesCount / leadsCurrent) * 1000) / 10 : 0;
-    // Previous-period conversion rate needs previous sales count too — reuse revenuePrev's row count via a light second query.
-    const prevSalesCountRow = await execute(
-      `SELECT COUNT(*) as cnt FROM sales WHERE created_at BETWEEN :s AND :e`,
-      { s: prevStartBound, e: prevEndBound }
-    );
-    const prevSalesCount = Number((prevSalesCountRow.rows[0] as unknown as { cnt: number })?.cnt ?? 0);
-    const conversionRatePrevious =
-      leadsPrevious > 0 ? Math.round((prevSalesCount / leadsPrevious) * 1000) / 10 : 0;
+    // Sort by oldest first (most urgent)
+    openDeposits.sort((a, b) => a.depositDate.localeCompare(b.depositDate));
 
-    const spend = Number(adSpendRow?.spend ?? 0);
-    const adRevenue = Number(adSpendRow?.revenue ?? 0);
-    const roas = spend > 0 ? Math.round((adRevenue / spend) * 10) / 10 : 0;
+    const totalLow = openDeposits.reduce((s, d) => s + d.lowValue, 0);
+    const totalHigh = openDeposits.reduce((s, d) => s + d.highValue, 0);
 
-    const data = {
-      rangeLabel: days === 1 ? "Today" : `${days} Days`,
-      days,
-      revenue: { current: revenueCurrent, previous: revenuePrevTotal },
-      newSales: { count: salesCount, value: revenueCurrent },
-      aov: { current: salesCount > 0 ? Math.round(revenueCurrent / salesCount) : 0 },
-      leads: { current: leadsCurrent, previous: leadsPrevious },
-      eventRegs: {
-        webinar: Number(regsRow?.webinar ?? 0),
-        challenge: Number(regsRow?.challenge ?? 0),
-        total: Number(regsRow?.total ?? 0),
-        previous: regsPrevTotal,
-      },
-      conversionRate: { current: conversionRateCurrent, previous: conversionRatePrevious },
-      // Not yet backed by real per-segment data — extend the `clients` table
-      // (or similar) and replace these zeros once you're tracking it.
-      activeClients: {
-        dfy: { count: 0, capacity: 0, label: "Done For You" },
-        workshop: { count: 0, label: "Workshop" },
-        challenge: { count: 0, label: "VIP Challenge" },
-        book: { count: 0, label: "Book Buyers" },
-      },
-      referrals: { current: referralsCurrent, previous: referralsPrevious },
-      adSpend: { spend, revenue: adRevenue, roas },
-      alerts: [] as Array<{ type: string; message: string; area: string }>,
-      // Channel/funnel/offer breakdowns are placeholders until you add
-      // per-channel tracking (e.g. a `channel` column on `leads`/`sales`).
-      promote: { channels: [] as unknown[] },
-      profit: {
-        funnels: [] as unknown[],
-        aiSales: {
-          ticketsSold: 0,
-          assists: 0,
-          directSales: 0,
-          totalConversations: 0,
-          responseTime: "—",
-          revenue: 0,
-        },
-      },
-      produce: { offers: [] as unknown[], totalReferrals: referralsCurrent },
-    };
-
-    return NextResponse.json(data);
-  } catch (err) {
-    console.error("[api/metrics] Failed to compute metrics:", err);
-    return NextResponse.json(
-      { error: "Failed to load metrics from database" },
-      { status: 500 }
-    );
+    return NextResponse.json({
+      openDeposits,
+      totalLow,
+      totalHigh,
+      count: openDeposits.length,
+    });
+  } catch (error) {
+    console.error('Pipeline fetch error:', error);
+    return NextResponse.json({ openDeposits: [], totalLow: 0, totalHigh: 0, count: 0 });
   }
 }
