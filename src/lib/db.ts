@@ -99,6 +99,46 @@ const MIGRATIONS: string[] = [
     locked_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`,
+
+  // -------------------------------------------------------------------------
+  // Real business metrics tables — back the CEO Dashboard's numbers.
+  // Insert rows into these as real sales/leads/registrations/ad spend come
+  // in, and GET /api/metrics will aggregate them for the dashboard.
+  // -------------------------------------------------------------------------
+
+  `CREATE TABLE IF NOT EXISTS sales (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    amount INTEGER NOT NULL,
+    source TEXT,
+    customer_name TEXT,
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS leads (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    name TEXT,
+    email TEXT,
+    channel TEXT,
+    source TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS event_registrations (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    event_type TEXT CHECK (event_type IN ('webinar', 'challenge')),
+    attendee_name TEXT,
+    attendee_email TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS ad_spend (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    amount INTEGER NOT NULL,
+    revenue_attributed INTEGER DEFAULT 0,
+    channel TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`,
 ];
 
 async function runMigrations(): Promise<void> {
